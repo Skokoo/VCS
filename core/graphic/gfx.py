@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import curses
 
 _cc = [0] * 65536
