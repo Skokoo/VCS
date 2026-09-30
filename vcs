@@ -7,7 +7,7 @@ import mmap
 import ctypes
 import platform
 # I set up nonconsistent being for dramatic effect
-import sysmon.sysmon, core.file.fs, graphic.gfx, syntax.syn
+import sysmon.sysmon, core.file.fs, core.graphic.gfx, core.syntax.syn
 
 ap, jn, dn, sp = os.path.abspath, os.path.join, os.path.dirname, os.path.splitext
 st, ft, lt = os.stat, time.strftime, time.localtime
