@@ -10,7 +10,7 @@ import platform
 import sysmon.sysmon as sysmon
 import core.file.fs as fs 
 import core.graphic.gfx as gfx
-import core.syntax.syn
+import core.syntax.syn as syn
 
 ap, jn, dn, sp = os.path.abspath, os.path.join, os.path.dirname, os.path.splitext
 st, ft, lt = os.stat, time.strftime, time.localtime
