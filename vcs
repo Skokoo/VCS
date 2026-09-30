@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+import os
+import sys
+import curses
+import time
+import mmap
+import ctypes
+import platform
+# I set up nonconsistent being for dramatic effect
+import sysmon, fs, gfx, syn
+
+ap, jn, dn, sp = os.path.abspath, os.path.join, os.path.dirname, os.path.splitext
+st, ft, lt = os.stat, time.strftime, time.localtime
+
+x86 = platform.machine().lower() in ("x86_64", "amd64")
+
+'''
+a1:
+
+xor    eax, eax
+test   rsi, rsi
+jle    dend
+
+loop_start:
+ cmp    byte ptr [rdi], 0xa
+ jne    skip_inc
+ inc    rax
+
+skip_inc:
+ inc    rdi
+ dec    rsi
+ jnz    loop_start
+
+dend:
+ ret
+'''
+a1 = b"\x31\xc0\x48\x85\xf6\x7e\x10\x80\x3f\x0a\x75\x03\x48\xff\xc0\x48\xff\xc7\x48\xff\xce\x75\xf0\xc3"
+
+'''
+a2:
+
+xor    eax, eax
+test   rsi, rsi
+jle    dend          
+
+loop_start:
+ cmp    byte ptr [rdi], 0x0
+ je     found_null
+ inc    rdi
+ dec    rsi
+ jnz    loop_start
+
+found_null:
+ ret
+ mov    eax, 0x1
+ ret
+'''
+a2 = b"\x31\xc0\x48\x85\xf6\x7e\x0d\x80\x3f\x00\x74\x09\x48\xff\xc7\x48\xff\xce\x75\xf3\xc3\xb8\x01\x00\x00\x00\xc3"
+
+_fn_a1, _m_a1 = None, None
+_fn_a2, _m_a2 = None, None
+
+if x86:
+    try:
+        _m_a1 = mmap.mmap(-1, len(a1), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=7)
+        _m_a1.write(a1)
+        _fn_a1 = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_uint64, ctypes.c_int64)(ctypes.addressof(ctypes.c_char.from_buffer(_m_a1)))
+    except: pass
+    try:
+        _m_a2 = mmap.mmap(-1, len(a2), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=7)
+        _m_a2.write(a2)
+        _fn_a2 = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_uint64, ctypes.c_int64)(ctypes.addressof(ctypes.c_char.from_buffer(_m_a2)))
+    except: pass
+
+def run_a(c, p=0, z=0):
+    if not x86 or p == 0 or z <= 0: return -1
+    try:
+        if c == a1 and _fn_a1: return _fn_a1(p, z)
+        if c == a2 and _fn_a2: return _fn_a2(p, z)
+        b = mmap.mmap(-1, len(c), flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS, prot=7)
+        b.write(c)
+        a = ctypes.addressof(ctypes.c_char.from_buffer(b))
+        f = ctypes.CFUNCTYPE(ctypes.c_int64, ctypes.c_uint64, ctypes.c_int64)(a)
+        r = f(p, z)
+        b.close()
+        return r
+    except: return -1
+
+def get_git_branch(d):
+    curr = d
+    while curr and curr != dn(curr):
+        git_path = jn(curr, ".git")
+        if os.path.exists(git_path):
+            try:
+                head_file = jn(git_path, "HEAD") if os.path.isdir(git_path) else None
+                if not head_file and os.path.isfile(git_path):
+                    with open(git_path, "r") as f:
+                        line = f.read().strip()
+                        if line.startswith("gitdir: "):
+                            head_file = jn(ap(jn(curr, line[8:].strip())), "HEAD")
+                if head_file and os.path.exists(head_file):
+                    with open(head_file, "r") as f:
+                        content = f.read().strip()
+                        if content.startswith("ref: refs/heads/"):
+                            return content[16:]
+                        return content[:7]
+            except: pass
+            return "git"
+        curr = dn(curr)
+    return None
+
+def get_fl(d):
+    tree = fs.get_tree(d)
+    cache = []
+    for it in tree:
+        if it == "..":
+            cache.append((it, " 󰅚../", curses.color_pair(1) | curses.A_BOLD))
+        else:
+            fp2 = jn(d, it)
+            if os.path.isdir(fp2): tx, at = f" 󰉋 {it}/", curses.color_pair(1) | curses.A_BOLD
+            elif fs.is_exe(fp2): tx, at = f" 󰆍 {it}*", curses.color_pair(5) | curses.A_BOLD
+            else:
+                ico = "󰈔 " if it.endswith((".s", ".S", ".asm")) else "󰈙 "
+                tx, at = f" {ico}{it}", 0
+            cache.append((it, tx, at))
+    return tree, cache
+
+def filter_fl(cache, query):
+    if not query: return cache
+    q = query.lower()
+    return [item for item in cache if q in item[0].lower()]
+
+def main(s):
+    ad, rf, gc, sr, sp2 = s.addstr, s.refresh, s.getch, syn.run, syn.parse_ansi_to_curses_segments
+    curses.use_default_colors()
+    curses.start_color()
+    for i_col, (f, b_col) in enumerate([(75,-1),(244,-1),(255,-1),(239,235),(46,-1),(204,-1),(250,235),(81,-1)], 1):
+        try: curses.init_pair(i_col, f, b_col)
+        except: pass
+
+    s.keypad(True)
+    curses.curs_set(0)
+    s.timeout(16)
+    try: curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    except: pass
+
+    cd = ap(".")
+    fl, fl_cache = get_fl(cd)
+    git_br = get_git_branch(cd)
+
+    hi, i, o, p, fp, fe = [], 0, 0, "side", None, ""
+    m, f, b, n = None, None, False, 0
+    r, c, hl, rh, th = [], [], False, False, "pastel"
+    oy, ox, rm, cp, lc, mg = 0, 0, 0.0, 0.0, 0, ""
+    raw_txt = ""
+    info_cache_key, info_cache_val = None, ("", "", "", "")
+
+    search_q = ""
+    in_search = False
+
+    def cl():
+        nonlocal m, f, fp, hl, p, r, c, mg, raw_txt, info_cache_key
+        if m: 
+            try: m.close()
+            except: pass
+            m = None
+        if f:
+            try: f.close()
+            except: pass
+            f = None
+        fp, hl, p, r, c, mg, raw_txt, info_cache_key = None, False, "side", [], [], "", "", None
+
+    while True:
+        s.erase()
+        h, w = s.getmaxyx()
+        if h < 15 or w < 40:
+            ad(0, 0, "Terminal too small")
+            rf()
+            if gc() == ord('q'): cl(); break
+            continue
+
+        active_cache = filter_fl(fl_cache, search_q)
+        active_fl = [x[0] for x in active_cache]
+
+        if i >= len(active_cache): i = max(0, len(active_cache) - 1)
+
+        sw = min(28, max(12, w // 4))
+        nw = time.time()
+        if nw - lc > 0.5:
+            rm, cp, lc = sysmon.get_ram_mb(), sysmon.get_cpu_percent(), nw
+
+        try:
+            ad(0, 0, "─" * sw + "┬" + "─" * (w - sw - 1), curses.A_DIM)
+            ad(1, 0, " File Explorer".ljust(sw)[:sw], curses.A_BOLD | curses.color_pair(8))
+            fn = os.path.basename(fp) if fp else "Welcome"
+            ad(1, sw + 1, f" {fn} ", curses.A_BOLD | curses.color_pair(7))
+            if fp: ad(1, sw + 1 + len(fn) + 2, f" {th} {fe} ", curses.A_DIM)
+        except: pass
+
+        mh = h - 14
+        if i < o: o = i
+        if i >= o + mh: o = i - mh + 1
+
+        for j in range(mh):
+            k = o + j
+            if k >= len(active_cache): break
+            it, tx, at = active_cache[k]
+            y = j + 2
+            tx_disp = tx[:sw - 1].ljust(sw - 1)
+            if p == "side" and k == i: at = curses.A_REVERSE
+            try: ad(y, 0, tx_disp, at)
+            except: pass
+
+        for y in range(h - 1):
+            try: ad(y, sw, "│", curses.A_DIM)
+            except: pass
+
+        try:
+            tp = h - 12
+            ad(tp, 0, "╭─ File Info ─".ljust(sw - 1, "─") + "╮", curses.color_pair(8) | curses.A_BOLD)
+            ad(tp + 1, 0, "│".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+            if active_fl and i < len(active_fl):
+                curr_key = (cd, active_fl[i], sw)
+                if curr_key != info_cache_key:
+                    info_cache_key = curr_key
+                    sel = active_fl[i]
+                    if sel == "..": l1, l2, l3, l4 = " Name:..", " Type: Parent", " Size: -", " Go up"
+                    else:
+                        path = jn(cd, sel)
+                        try:
+                            st_ = st(path)
+                            sh = sel if len(sel) <= sw - 5 else sel[:sw - 8] + ".."
+                            l1 = f" {sh}"
+                            if os.path.isdir(path):
+                                l2 = " Type: Folder"
+                                try: l3 = f" Items: {len(os.listdir(path))}"
+                                except: l3 = " Items: -"
+                                l4 = f" Mod: {ft('%d %b', lt(st_.st_mtime))}"
+                            else:
+                                _, ex = sp(sel.lower())
+                                typ = "Python" if ex in (".py", ".pyw") else "C++" if ex in (".cpp", ".c", ".h", ".hpp") else "Assembly" if ex in (".s", ".S", ".asm") else "Executable" if fs.is_exe(path) else ex[1:].upper() if ex else "File"
+                                l2, l3, l4 = f" Type: {typ}", f" Size: {fs.fsize(st_.st_size)}", f" Mod: {ft('%d %b %H:%M', lt(st_.st_mtime))}"
+                        except: l1, l2, l3, l4 = f" {sel[:sw-4]}", " Type:?", " Size:?", " "
+                    info_cache_val = (l1, l2, l3, l4)
+                l1, l2, l3, l4 = info_cache_val
+                ad(tp + 2, 0, f"│{l1}".ljust(sw - 1)[:sw - 1] + "│", curses.color_pair(3))
+                ad(tp + 3, 0, f"│{l2}".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+                ad(tp + 4, 0, f"│{l3}".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+                ad(tp + 5, 0, f"│{l4}".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+            ad(tp + 6, 0, "├" + "─" * (sw - 2) + "┤", curses.color_pair(8))
+            ad(tp + 7, 0, "│ Resource".ljust(sw - 1)[:sw - 1] + "│", curses.color_pair(8) | curses.A_BOLD)
+            ad(tp + 8, 0, "│".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+            ad(tp + 9, 0, f"│ RAM: {rm:.1f} MB".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+            ad(tp + 10, 0, f"│ CPU: {cp:.1f}%".ljust(sw - 1)[:sw - 1] + "│", curses.A_DIM)
+            ad(tp + 11, 0, "╰" + "─" * (sw - 2) + "╯", curses.color_pair(8))
+        except: pass
+
+        tc = len(c) if (hl and not b) else n
+        mv = h - 3
+
+        if fp and (m is not None or not b):
+            if hl and not b:
+                if rh:
+                    c = sp2(sr(raw_txt, th, fe))
+                    rh = False
+                    tc = len(c)
+                ve = min(oy + mv, len(c))
+                for k in range(oy, ve):
+                    sy, bx = k - oy + 2, sw + 5
+                    try: ad(sy, sw + 1, f"{k+1:3} │ ", curses.color_pair(2))
+                    except: pass
+                    if p == "view" and k == oy:
+                        try: ad(sy, bx, " " * (w - bx - 1), curses.color_pair(4))
+                        except: pass
+                    cur, cx = 0, bx
+                    for txt, fg, bg in c[k]:
+                        se = cur + len(txt)
+                        if se <= ox: cur = se; continue
+                        if cur < ox: txt = txt[ox - cur:]
+                        cur = se
+                        if cx >= w - 1: break
+                        dr = txt[:w - cx - 1]
+                        bgu = 235 if (p == "view" and k == oy) else -1
+                        co = gfx.get_pair(fg, bgu, -1) or curses.color_pair(3)
+                        try: ad(sy, cx, dr, co)
+                        except: pass
+                        cx += len(dr)
+            else:
+                ve = min(oy + mv, n)
+                for k in range(oy, ve):
+                    sy = k - oy + 2
+                    try: ad(sy, sw + 1, f"{k+1:3} │ ", curses.color_pair(2))
+                    except: pass
+                    if p == "view" and k == oy:
+                        try: ad(sy, sw + 5, " " * (w - sw - 6), curses.color_pair(4))
+                        except: pass
+                    if b and m:
+                        off = k * 16
+                        ck = m[off : off + 16]
+                        hs = "".join(gfx.HX[x] for x in ck).ljust(48)
+                        as_ = "".join(gfx.AM[x] for x in ck)
+                        ln = f"{off:08x}: {hs}│ {as_}"
+                    else: ln = r[k] if k < len(r) else ""
+                    if ox < len(ln):
+                        try: ad(sy, sw + 5, ln[ox : ox + (w - sw - 6)])
+                        except: pass
+        else:
+            try:
+                x0, ww = sw + 3, w - sw - 5
+                ad(2, x0, "╭─ VC Studio ─".ljust(ww - 1, "─") + "╮", curses.color_pair(8) | curses.A_BOLD)
+                ad(3, x0, "│".ljust(ww - 1) + "│", curses.color_pair(8))
+                ad(3, x0 + 2, " lightweight terminal file reviewer", curses.A_BOLD)
+                ad(4, x0, "│".ljust(ww - 1) + "│", curses.color_pair(8))
+                ad(4, x0 + 2, " v1.0.0", curses.A_DIM)
+                ad(5, x0, "│".ljust(ww - 1) + "│", curses.color_pair(8))
+                ad(6, x0, "├─ Controls ─".ljust(ww - 1, "─") + "┤", curses.color_pair(8))
+                ad(7, x0, f"│ Enter : open | / : search".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(8, x0, f"│ Tab   : switch pane".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(9, x0, f"│ u     : prev folder".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(10, x0, f"│ c     : theme".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(11, x0, f"│ x     : close file".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(12, x0, f"│ q     : quit".ljust(ww - 1)[:ww - 1] + "│", curses.A_DIM)
+                ad(13, x0, "╰" + "─" * (ww - 2) + "╯", curses.color_pair(8))
+            except: pass
+
+        try:
+            git_str = f" [{git_br}]" if git_br else ""
+            if in_search:
+                bar = f" Search: {search_q}_"
+            else:
+                inf = f" {mg} " if mg else f" [/] filter [Tab] switch [q] quit "
+                if search_q: inf = f" [Filter: '{search_q}'] " + inf
+                bar = f" {p.upper()}{git_str} │ {cd} │ {i+1}/{len(active_fl)} │{inf}"
+            ad(h - 1, 0, bar.ljust(w - 1)[:w - 1], curses.color_pair(7) | curses.A_BOLD)
+        except: pass
+
+        rf()
+        ch = gc()
+
+        if in_search:
+            if ch == 27:
+                in_search = False; search_q = ""
+            elif ch in (10, 13):
+                in_search = False
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                search_q = search_q[:-1]
+                if not search_q: in_search = False
+            elif 32 <= ch <= 126:
+                search_q += chr(ch)
+            continue
+
+        if ch == -1: continue
+        elif ch == ord('q'): cl(); break
+        elif ch == ord('/'):
+            in_search = True; search_q = ""; i = 0
+        elif ch == curses.KEY_MOUSE:
+            try:
+                _, mx, my, _, bstate = curses.getmouse()
+                is_up = bool(bstate & getattr(curses, "BUTTON4_PRESSED", 0x80000))
+                is_dn = bool(bstate & getattr(curses, "BUTTON5_PRESSED", 0x800000))
+                if mx < sw or p == "side":
+                    if is_up and i > 0: i -= 1
+                    elif is_dn and i < len(active_fl) - 1: i += 1
+                else:
+                    if is_up and oy > 0: oy -= 1
+                    elif is_dn and oy < tc - 1: oy += 1
+            except: pass
+        elif ch == 9 and fp: p = "view" if p == "side" else "side"
+        elif ch == ord('u'):
+            if hi:
+                cd = hi.pop()
+                fl, fl_cache = get_fl(cd)
+                git_br = get_git_branch(cd)
+                i, o, search_q = 0, 0, ""
+        elif ch == ord('x'): cl()
+        elif ch == ord('c') and fp and not b:
+            try:
+                p_str = f" Theme: {syn.thstr} > "
+                s.move(h - 1, 0); s.clrtoeol(); ad(h - 1, 0, p_str, curses.A_BOLD)
+                rf(); curses.echo(); curses.curs_set(1)
+                s.timeout(-1)
+                nt = s.getstr(h - 1, len(p_str), 20).decode().strip()
+                s.timeout(16); curses.noecho(); curses.curs_set(0)
+                if nt in syn.thms: th, hl, rh = nt, True, True
+            except:
+                s.timeout(16); curses.noecho(); curses.curs_set(0)
+        elif p == "side":
+            if ch == curses.KEY_UP and i > 0: i -= 1
+            elif ch == curses.KEY_DOWN and i < len(active_fl) - 1: i += 1
+            elif ch == curses.KEY_PPAGE: i = max(0, i - max(1, mh - 2))
+            elif ch == curses.KEY_NPAGE: i = min(max(0, len(active_fl) - 1), i + max(1, mh - 2))
+            elif ch == ord('g'): i = 0
+            elif ch == ord('G'): i = max(0, len(active_fl) - 1)
+            elif ch in (10, 13) and active_fl:
+                sel = active_fl[i]
+                nxt = ap(jn(cd, ".." if sel == ".." else sel))
+                if os.path.isdir(nxt):
+                    if nxt != cd:
+                        hi.append(cd)
+                        cd = nxt
+                        fl, fl_cache = get_fl(cd)
+                        git_br = get_git_branch(cd)
+                        i, o, search_q = 0, 0, ""
+                else:
+                    cl()
+                    fp, cd = nxt, dn(nxt)
+                    fl, fl_cache = get_fl(cd)
+                    git_br = get_git_branch(cd)
+                    _, fe = sp(sel.lower())
+                    try:
+                        sz = st(fp).st_size
+                        if sz > 0:
+                            f = open(fp, "rb")
+                            m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
+                            ptr = ctypes.addressof(ctypes.c_char.from_buffer(m))
+                            rn = run_a(a2, ptr, min(2048, sz))
+                            b = (rn == 1) if rn != -1 else (b'\x00' in m[:2048])
+                            if b: n, hl = (sz + 15) // 16, False
+                            else:
+                                raw_data = bytes(m)
+                                raw_txt = raw_data.decode("utf-8", "ignore").replace("\r", "")
+                                r = raw_txt.splitlines() or [""]
+                                rnl = run_a(a1, ptr, sz)
+                                n = rnl if rnl != -1 else len(r)
+                                hl, rh = True, True
+                        else: n, r, raw_txt = 0, [""], ""
+                    except Exception as e: r, n, raw_txt = [f"Failed to read: {e}"], 1, ""
+                    p, oy, ox = "view", 0, 0
+        elif p == "view":
+            step = max(1, mv - 2)
+            if ch == curses.KEY_UP and oy > 0: oy -= 1
+            elif ch == curses.KEY_DOWN and oy < tc - 1: oy += 1
+            elif ch == curses.KEY_PPAGE: oy = max(0, oy - step)
+            elif ch == curses.KEY_NPAGE: oy = min(max(0, tc - 1), oy + step)
+            elif ch == ord('g'): oy = 0
+            elif ch == ord('G'): oy = max(0, tc - 1)
+            elif ch == curses.KEY_LEFT: ox = max(0, ox - 4)
+            elif ch == curses.KEY_RIGHT: ox += 4
+
+if __name__ == "__main__":
+    try: curses.wrapper(main)
+    finally: sysmon.cleanup()
