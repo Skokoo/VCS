@@ -1,6 +1,15 @@
 #!/bin/bash
 # UX thingy
 
+if [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo -e "usage: bash install.sh [option]\n"
+    echo "  (none)  install vcs shortcut"
+    echo "  -r      remove vcs shortcut"
+    echo "  -h      show this help message"
+    echo -e "\nwhy am i creating this"
+    exit 0
+fi
+
 m=$(uname -m)
 case "$m" in
     *arm*|*aarch64*) is_arm=1 ;;
